@@ -1,3 +1,6 @@
+import os
+import threading
+from flask import Flask
 import telebot
 from telebot.types import InlineKeyboardMarkup, InlineKeyboardButton, ReactionTypeEmoji
 import sqlite3
@@ -282,6 +285,25 @@ def notify_startup():
     try: bot.send_message(ADMIN_ID, f"🫡 Я в строю!\n\nРаботаю в этих чатах:\n{chat_list}")
     except: pass
 
-print("Шпион запущен!")
-notify_startup()
-bot.infinity_polling()
+# --- МИКРО-СЕРВЕР ДЛЯ RENDER ---
+app = Flask(__name__)
+
+@app.route('/')
+def keep_alive():
+    return "Шпион в сети и работает! 🕵️‍♂️"
+
+def run_flask():
+    # Render сам выдает нужный порт через переменные окружения
+    port = int(os.environ.get("PORT", 10000))
+    app.run(host='0.0.0.0', port=port)
+
+# --- ЗАПУСК ---
+if __name__ == '__main__':
+    print("Шпион запущен!")
+    notify_startup()
+    
+    # Запускаем Flask в фоновом потоке, чтобы он не мешал боту
+    threading.Thread(target=run_flask).start()
+    
+    # Запускаем самого бота
+    bot.infinity_polling()
