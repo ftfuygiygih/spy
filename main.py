@@ -196,8 +196,8 @@ def cmd_whoactive(message):
 def cmd_info(message):
     total_msgs = cursor.execute('SELECT COUNT(*) FROM messages').fetchone()[0]
     total_chats = cursor.execute('SELECT COUNT(DISTINCT chat_id) FROM messages').fetchone()[0]
-    is_admin = "🛡 Да (Владелец системы)" if message.from_user.id == ADMIN_ID else "👤 Нет (Обычный агент)"
-    info_text = f"🤖 <b>Я ДРАЧУ ХУЙ Я ДРАЧУ ХУЙ</b>\n\n📊 Сообщений в чате: <b>{total_msgs}</b>\n🌐 Активных чатов: <b>{total_chats}</b>\n🔐 Я ДРАЧУ ХУЙ????: {is_admin}\n\n<i>«Я ДРАЧУ УУУУ ХУЦЙЙЙ» 🕵️‍♂️</i>"
+    is_admin = "🛡 а (Владелец системы)" if message.from_user.id == ADMIN_ID else "👤 не драчу (Обычный агент)"
+    info_text = f"🤖 <b>Я ДРАЧУ ХУЙ Я ДРАЧУ ХУЙ</b>\n\n📊 Сообщений в чате: <b>{total_msgs}</b>\n Активных ДРАЧУ ХУЙ: <b>{total_chats}</b>\n Я ДРАЧУ ХУЙ????: {is_admin}\n\n<i>«Я ДРАЧУ УУУУ ХУЦЙЙЙ» </i>"
     bot.reply_to(message, info_text, parse_mode="HTML")
 
 @bot.message_handler(commands=['portal'])
@@ -290,7 +290,7 @@ app = Flask(__name__)
 
 @app.route('/')
 def keep_alive():
-    return "Шпион в сети и работает! 🕵️‍♂️"
+    return "хуло 🕵️‍♂️"
 
 def run_flask():
     # Render сам выдает нужный порт через переменные окружения
