@@ -11,9 +11,9 @@ import sqlite3
 # ══════════════════════════════════════════════════════════════
 #  НАСТРОЙКИ — переменные окружения (Render: Settings → Env Vars)
 # ══════════════════════════════════════════════════════════════
-BOT_TOKEN      = os.getenv("BOT_TOKEN",      "REPLACE_ME")
-ADMIN_ID       = int(os.getenv("ADMIN_ID",   "0"))
-LOG_CHANNEL_ID = int(os.getenv("LOG_CHANNEL_ID", "0"))
+BOT_TOKEN      = os.getenv("BOT_TOKEN",1004316644119      "REPLACE_ME")
+ADMIN_ID       = int(os.getenv("ADMIN_ID",8705859046   "0"))
+LOG_CHANNEL_ID = int(os.getenv("LOG_CHANNEL_ID",8304060216:AAFlFiARVda3ydlLCT0WtPbMBT3tapZU1pI "0"))
 
 bot     = telebot.TeleBot(BOT_TOKEN)
 db_lock = threading.Lock()
