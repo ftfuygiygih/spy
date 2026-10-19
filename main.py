@@ -1,309 +1,649 @@
 import os
 import threading
+import html
+import random
+
 from flask import Flask
 import telebot
 from telebot.types import InlineKeyboardMarkup, InlineKeyboardButton, ReactionTypeEmoji
 import sqlite3
-import random
-import zipfile
-import io
-import html
 
-# --- НАСТРОЙКИ ---
-BOT_TOKEN = '8304060216:AAFlFiARVda3ydlLCT0WtPbMBT3tapZU1pI'
-ADMIN_ID = 8705859046           # Твой личный ID
-LOG_CHANNEL_ID = -1004316644119 # ID твоего приватного канала (обязательно начинается с -100)
+# ══════════════════════════════════════════════════════════════
+#  НАСТРОЙКИ — переменные окружения (Render: Settings → Env Vars)
+# ══════════════════════════════════════════════════════════════
+BOT_TOKEN      = os.getenv("BOT_TOKEN",      "REPLACE_ME")
+ADMIN_ID       = int(os.getenv("ADMIN_ID",   "0"))
+LOG_CHANNEL_ID = int(os.getenv("LOG_CHANNEL_ID", "0"))
 
-bot = telebot.TeleBot(BOT_TOKEN)
+bot     = telebot.TeleBot(BOT_TOKEN)
+db_lock = threading.Lock()
 
-# --- ИНИЦИАЛИЗАЦИЯ БАЗЫ ---
-conn = sqlite3.connect('chat_logger.db', check_same_thread=False)
+
+# ══════════════════════════════════════════════════════════════
+#  БАЗА — только счётчики. Полные сообщения хранит КАНАЛ.
+#
+#  Архитектура:
+#    Канал (LOG_CHANNEL_ID) = архив всех сообщений.
+#                             Поиск — встроенным поиском Telegram.
+#    SQLite               = быстрые счётчики для статистики.
+# ══════════════════════════════════════════════════════════════
+conn   = sqlite3.connect('bot.db', check_same_thread=False)
 cursor = conn.cursor()
 
-# Таблица логов
-cursor.execute('''
-    CREATE TABLE IF NOT EXISTS messages (
-        id INTEGER PRIMARY KEY AUTOINCREMENT,
-        chat_id INTEGER,
+cursor.executescript('''
+    CREATE TABLE IF NOT EXISTS user_stats (
+        chat_id    INTEGER,
         chat_title TEXT,
-        user_id INTEGER,
-        username TEXT,
-        text TEXT,
-        media_type TEXT,
-        timestamp DATETIME DEFAULT CURRENT_TIMESTAMP
-    )
-''')
-# Таблица репутации
-cursor.execute('''
-    CREATE TABLE IF NOT EXISTS reputation (
-        chat_id INTEGER,
-        user_id INTEGER,
-        username TEXT,
-        score INTEGER DEFAULT 0,
+        user_id    INTEGER,
+        username   TEXT,
+        msg_count  INTEGER DEFAULT 0,
+        mood_pos   INTEGER DEFAULT 0,
+        mood_neg   INTEGER DEFAULT 0,
+        last_seen  DATETIME DEFAULT CURRENT_TIMESTAMP,
         PRIMARY KEY(chat_id, user_id)
-    )
-''')
-# Таблица настроек (для сохранения гифки)
-cursor.execute('''
+    );
+    CREATE TABLE IF NOT EXISTS reputation (
+        chat_id  INTEGER,
+        user_id  INTEGER,
+        username TEXT,
+        score    INTEGER DEFAULT 0,
+        PRIMARY KEY(chat_id, user_id)
+    );
     CREATE TABLE IF NOT EXISTS settings (
-        key TEXT PRIMARY KEY,
+        key   TEXT PRIMARY KEY,
         value TEXT
-    )
+    );
+    CREATE TABLE IF NOT EXISTS watchlist (
+        user_id  INTEGER PRIMARY KEY,
+        username TEXT,
+        added_at DATETIME DEFAULT CURRENT_TIMESTAMP
+    );
 ''')
 conn.commit()
 
-# --- ПАНЕЛЬ УПРАВЛЕНИЯ ДАМПАМИ В ЛС ---
 
-@bot.message_handler(commands=['dump', 'start'], func=lambda m: m.chat.type == 'private')
-def pm_menu(message):
-    if message.from_user.id != ADMIN_ID: return
-    cursor.execute('SELECT DISTINCT chat_id, chat_title FROM messages')
-    chats = cursor.fetchall()
-    
-    if not chats:
-        bot.send_message(message.chat.id, "🗄 База пуста. Бот еще ничего не перехватил.")
+# ══════════════════════════════════════════════════════════════
+#  ВСПОМОГАТЕЛЬНЫЕ — БД
+# ══════════════════════════════════════════════════════════════
+def db_get_chats():
+    with db_lock:
+        return cursor.execute(
+            'SELECT chat_id, chat_title, SUM(msg_count) as total '
+            'FROM user_stats GROUP BY chat_id ORDER BY total DESC'
+        ).fetchall()
+
+def db_top_users(chat_id, limit=5):
+    with db_lock:
+        return cursor.execute(
+            'SELECT username, msg_count FROM user_stats '
+            'WHERE chat_id = ? ORDER BY msg_count DESC LIMIT ?',
+            (chat_id, limit)
+        ).fetchall()
+
+def db_top_rep(chat_id, limit=3):
+    with db_lock:
+        return cursor.execute(
+            'SELECT username, score FROM reputation '
+            'WHERE chat_id = ? AND score > 0 ORDER BY score DESC LIMIT ?',
+            (chat_id, limit)
+        ).fetchall()
+
+def db_chat_mood(chat_id=None):
+    """Возвращает (pos_total, neg_total) для чата или всех чатов."""
+    q = 'SELECT SUM(mood_pos), SUM(mood_neg) FROM user_stats'
+    p = ()
+    if chat_id:
+        q += ' WHERE chat_id = ?'
+        p  = (chat_id,)
+    with db_lock:
+        row = cursor.execute(q, p).fetchone()
+    pos = row[0] or 0
+    neg = row[1] or 0
+    return pos, neg
+
+def mood_line(chat_id=None) -> str:
+    pos, neg = db_chat_mood(chat_id)
+    total = pos + neg
+    if total == 0:
+        return "😶 Настроение: данных нет"
+    pct_p = round(pos / total * 100)
+    pct_n = 100 - pct_p
+    emoji = '😊' if pct_p > 60 else ('😡' if pct_n > 60 else '😐')
+    return f"{emoji} {pct_p}% / {pct_n}% (по {total} сообщ.)"
+
+
+# ══════════════════════════════════════════════════════════════
+#  НАСТРОЕНИЕ — разговорный русский с матом
+# ══════════════════════════════════════════════════════════════
+POSITIVE = [
+    'огонь', 'топ', 'круто', 'спасибо', 'красавчик', 'красавица',
+    'кайф', 'бомба', 'зачёт', 'зачет', 'лучший', 'обожаю', 'отлично',
+    'супер', 'ахах', 'хаха', 'ахахах', 'лол', 'красота', 'молодец',
+    'прикол', 'кек', 'хорошо', 'норм', 'четко', 'чётко', 'умница',
+    'класс', 'шикарно', 'угар', 'збс', 'заебись', 'пиздато',
+    'охуенно', 'охуительно', 'ахуенно',
+    '🔥', '👍', '😂', '❤️', '💪', '👏', '🤣', '😍', '💯', '🎉', '🤩',
+]
+
+NEGATIVE = [
+    'хуево', 'пиздец', 'отстой', 'ужас', 'хуйня', 'говно', 'дерьмо',
+    'заебало', 'заебал', 'нахуй', 'похуй', 'бесит', 'тупо', 'кринж',
+    'фу', 'ненавижу', 'достало', 'достал', 'плохо', 'ужасно',
+    'блять', 'бля', 'сука', 'мразь', 'идиот', 'дебил',
+    '💀', '👎', '🤮', '😤', '😡', '🖕', '🤬', '😒',
+]
+
+def analyze_mood(text: str):
+    if not text:
+        return None
+    t = text.lower()
+    pos = sum(1 for w in POSITIVE if w in t)
+    neg = sum(1 for w in NEGATIVE if w in t)
+    if pos == 0 and neg == 0:
+        return None
+    return 'positive' if pos >= neg else 'negative'
+
+
+# ══════════════════════════════════════════════════════════════
+#  ВОТЧЛИСТ
+# ══════════════════════════════════════════════════════════════
+def is_watched(user_id: int) -> bool:
+    with db_lock:
+        return bool(cursor.execute(
+            'SELECT 1 FROM watchlist WHERE user_id = ?', (user_id,)
+        ).fetchone())
+
+def get_watchlist():
+    with db_lock:
+        return cursor.execute(
+            'SELECT user_id, username, added_at FROM watchlist'
+        ).fetchall()
+
+def add_to_watch(user_id: int, username: str):
+    with db_lock:
+        cursor.execute(
+            'INSERT OR REPLACE INTO watchlist (user_id, username) VALUES (?, ?)',
+            (user_id, username)
+        )
+        conn.commit()
+
+def remove_from_watch(user_id: int):
+    with db_lock:
+        cursor.execute('DELETE FROM watchlist WHERE user_id = ?', (user_id,))
+        conn.commit()
+
+
+# ══════════════════════════════════════════════════════════════
+#  /watch — в группе: ответь на сообщение + /watch
+# ══════════════════════════════════════════════════════════════
+@bot.message_handler(
+    commands=['watch'],
+    func=lambda m: m.chat.type in ['group', 'supergroup']
+)
+def cmd_watch(message):
+    if message.from_user.id != ADMIN_ID:
         return
-        
+    if not message.reply_to_message:
+        bot.reply_to(message, "⚠️ Ответь на сообщение нужного пользователя")
+        return
+    target = message.reply_to_message.from_user
+    if target.is_bot:
+        return
+    uname = target.username or target.first_name
+    add_to_watch(target.id, uname)
+    try:
+        bot.delete_message(message.chat.id, message.message_id)
+    except Exception:
+        pass
+    bot.send_message(
+        ADMIN_ID,
+        f"👁 <b>@{html.escape(uname)}</b> добавлен.\n"
+        f"Чат: <i>{html.escape(message.chat.title or '')}</i>",
+        parse_mode='HTML'
+    )
+
+
+# ══════════════════════════════════════════════════════════════
+#  ПАНЕЛЬ УПРАВЛЕНИЯ — только в ЛС у админа
+# ══════════════════════════════════════════════════════════════
+@bot.message_handler(commands=['panel', 'start'], func=lambda m: m.chat.type == 'private')
+def pm_panel(message):
+    if message.from_user.id != ADMIN_ID:
+        bot.send_message(message.chat.id, "👋 Привет! Я бот-помощник для групп.")
+        return
+
+    chats = db_get_chats()
+    watched = get_watchlist()
+
+    # Строим список чатов
+    chats_text = ""
+    for chat_id, title, total in chats:
+        pos, neg = db_chat_mood(chat_id)
+        mood_tot = pos + neg
+        mood_str = f"{round(pos/mood_tot*100)}%+" if mood_tot else "—"
+        chats_text += f"  🔹 <b>{html.escape(title or str(chat_id))}</b>\n"
+        chats_text += f"      {total} сообщ. · настроение {mood_str}\n"
+
+    watch_text = f"{len(watched)} чел." if watched else "пусто"
+
+    # Получаем ссылку на канал
+    try:
+        channel = bot.get_chat(LOG_CHANNEL_ID)
+        channel_link = f"<a href='https://t.me/c/{str(LOG_CHANNEL_ID).replace('-100', '')}/1'>📺 {html.escape(channel.title or 'Канал')}</a>"
+    except Exception:
+        channel_link = f"<code>{LOG_CHANNEL_ID}</code>"
+
+    text = (
+        f"⚙️ <b>Управление</b>\n\n"
+        f"📡 <b>Активных чатов:</b> {len(chats)}\n"
+        f"{chats_text}\n"
+        f"👁 <b>Вотчлист:</b> {watch_text}\n"
+        f"🗄 <b>Архив:</b> {channel_link}\n\n"
+        f"<i>Поиск по архиву — встроенным поиском Telegram в канале.</i>"
+    )
+
+    markup = InlineKeyboardMarkup(row_width=2)
+    markup.add(
+        InlineKeyboardButton("👁 Вотчлист", callback_data="show_watchlist"),
+        InlineKeyboardButton("🎭 Писать от бота", callback_data="face_menu"),
+    )
+    markup.add(
+        InlineKeyboardButton("🏆 Топ активности", callback_data="top_menu"),
+    )
+
+    bot.send_message(message.chat.id, text, parse_mode='HTML',
+                     reply_markup=markup, disable_web_page_preview=True)
+
+
+# ── Вотчлист через кнопку ──────────────────────────────────
+@bot.callback_query_handler(func=lambda c: c.data == 'show_watchlist')
+def cb_watchlist(call):
+    if call.from_user.id != ADMIN_ID:
+        return
+    rows = get_watchlist()
+    bot.answer_callback_query(call.id)
+    if not rows:
+        bot.send_message(call.message.chat.id, "👁 Вотчлист пуст.")
+        return
     markup = InlineKeyboardMarkup()
-    for chat_id, title in chats:
-        chat_name = title if title else str(chat_id)
-        markup.add(InlineKeyboardButton(text=f"📁 Дамп: {chat_name}", callback_data=f"dump_{chat_id}"))
-        
-    bot.send_message(message.chat.id, "🕵️‍♂️ Меню управления дампами:", reply_markup=markup)
+    text   = "👁 <b>Вотчлист:</b>\n\n"
+    for uid, uname, added in rows:
+        text   += f"• @{html.escape(uname or '?')} · <code>{uid}</code> · с {added[:10]}\n"
+        markup.add(InlineKeyboardButton(
+            f"❌ Снять @{uname}", callback_data=f"unwatch_{uid}"
+        ))
+    markup.add(InlineKeyboardButton("◀️ Назад", callback_data="back_panel"))
+    bot.send_message(call.message.chat.id, text, parse_mode='HTML', reply_markup=markup)
 
 
-# --- ГЕНЕРАЦИЯ HTML И ZIP АРХИВА ---
-def generate_html_dump(chat_title, msgs):
-    html_out = f"""<!DOCTYPE html><html lang="ru"><head><meta charset="UTF-8">
-    <title>Дамп чата: {html.escape(chat_title)}</title>
-    <style>
-        body {{ background-color: #0e1621; color: #fff; font-family: sans-serif; padding: 20px; }}
-        .chat-container {{ max-width: 800px; margin: 0 auto; background: #17212b; padding: 20px; border-radius: 10px; }}
-        .header {{ text-align: center; border-bottom: 1px solid #242f3d; padding-bottom: 10px; margin-bottom: 20px; }}
-        .msg {{ margin-bottom: 15px; padding: 10px; border-radius: 8px; background: #182533; display: inline-block; min-width: 250px; max-width: 90%; }}
-        .msg-author {{ color: #64b5f6; font-weight: bold; margin-bottom: 5px; font-size: 14px; }}
-        .msg-text {{ font-size: 15px; line-height: 1.4; word-wrap: break-word; }}
-        .msg-media {{ color: #ffb74d; font-size: 12px; margin-top: 5px; font-style: italic; }}
-        .msg-time {{ color: #6a7b8c; font-size: 11px; text-align: right; margin-top: 5px; }}
-    </style></head><body>
-    <div class="chat-container">
-        <div class="header"><h2>📁 Дамп чата: {html.escape(chat_title)}</h2><p>Всего сообщений: {len(msgs)}</p></div>
-    """
-    for m in msgs:
-        name = html.escape(m[1] or "Аноним")
-        text = html.escape(m[2] or "").replace('\n', '<br>')
-        media = f"<div class='msg-media'>[Вложение: {m[3]}]</div>" if m[3] else ""
-        time_str = m[4]
-        
-        html_out += f"""<div class="msg"><div class="msg-author">{name}</div>
-        <div class="msg-text">{text}</div>{media}<div class="msg-time">{time_str}</div></div><br>"""
-    
-    html_out += "</div></body></html>"
-    return html_out
-
-@bot.callback_query_handler(func=lambda call: call.data.startswith('dump_'))
-def handle_dump_request(call):
-    if call.from_user.id != ADMIN_ID: return
-    target_chat_id = call.data.split('_')[1]
-    
-    bot.answer_callback_query(call.id, "Инициализация сборки...")
-    bot.edit_message_text(f"⏳ Готовлю HTML-архив для чата <code>{target_chat_id}</code>...", call.message.chat.id, call.message.message_id, parse_mode='HTML')
-    
-    cursor.execute('SELECT chat_title, username, text, media_type, timestamp FROM messages WHERE chat_id = ? ORDER BY timestamp ASC', (target_chat_id,))
-    msgs = cursor.fetchall()
-    
-    if not msgs:
-        bot.edit_message_text("❌ В базе нет сообщений из этого чата.", call.message.chat.id, call.message.message_id)
+@bot.callback_query_handler(func=lambda c: c.data.startswith('unwatch_'))
+def cb_unwatch(call):
+    if call.from_user.id != ADMIN_ID:
         return
-
-    chat_title = msgs[0][0] or str(target_chat_id)
-    html_content = generate_html_dump(chat_title, msgs)
-    
-    # Создаем ZIP архив в оперативной памяти
-    zip_buffer = io.BytesIO()
-    with zipfile.ZipFile(zip_buffer, 'w', zipfile.ZIP_DEFLATED) as zip_file:
-        zip_file.writestr('index.html', html_content.encode('utf-8'))
-        zip_file.writestr('media/', b'') # Создаем пустую папку для медиа (на будущее)
-    
-    zip_buffer.seek(0)
-    zip_buffer.name = f"dump_{target_chat_id}.zip"
-    
-    bot.edit_message_text(f"✅ Дамп чата <b>{chat_title}</b> успешно собран! Отправляю файл...", call.message.chat.id, call.message.message_id, parse_mode='HTML')
-    bot.send_document(call.message.chat.id, zip_buffer, caption=f"📁 Полный архив переписки: {chat_title}")
+    uid = int(call.data.split('_')[1])
+    remove_from_watch(uid)
+    bot.answer_callback_query(call.id, "Снят.")
+    try:
+        bot.edit_message_text(
+            "✅ Снят с наблюдения.",
+            call.message.chat.id, call.message.message_id
+        )
+    except Exception:
+        pass
 
 
-# --- КОМАНДА /gif (ЗАМЕНА ГИФКИ ДЛЯ ПОРТАЛА) ---
-@bot.message_handler(commands=['gif'], func=lambda m: m.chat.type == 'private')
-def cmd_gif(message):
-    if message.from_user.id != ADMIN_ID: return
-    msg = bot.send_message(message.chat.id, "🌀 Пришли мне гифку (анимацию), которую я буду использовать для открытия порталов:")
-    bot.register_next_step_handler(msg, process_gif_save)
-
-def process_gif_save(message):
-    if not message.animation and not message.document:
-        bot.send_message(message.chat.id, "❌ Это не гифка. Попробуй вызвать /gif еще раз.")
+@bot.callback_query_handler(func=lambda c: c.data == 'back_panel')
+def cb_back(call):
+    if call.from_user.id != ADMIN_ID:
         return
-    
-    file_id = message.animation.file_id if message.animation else message.document.file_id
-    cursor.execute('INSERT OR REPLACE INTO settings (key, value) VALUES (?, ?)', ('portal_gif', file_id))
-    conn.commit()
-    bot.send_message(message.chat.id, "✅ Отлично! Гифка для порталов успешно обновлена и сохранена в базу.")
+    bot.answer_callback_query(call.id)
+    try:
+        bot.delete_message(call.message.chat.id, call.message.message_id)
+    except Exception:
+        pass
+    # Переиспользуем логику панели
+    class FakeMsg:
+        chat = call.message.chat
+        from_user = call.from_user
+    pm_panel(FakeMsg())
 
 
-# --- КОМАНДА /face (ПИСАТЬ ОТ ЛИЦА БОТА) ---
-@bot.message_handler(commands=['face'], func=lambda m: m.chat.type == 'private')
-def cmd_face(message):
-    if message.from_user.id != ADMIN_ID: return
-    cursor.execute('SELECT DISTINCT chat_id, chat_title FROM messages')
-    chats = cursor.fetchall()
+# ── Топ активности через кнопку ───────────────────────────
+@bot.callback_query_handler(func=lambda c: c.data == 'top_menu')
+def cb_top_menu(call):
+    if call.from_user.id != ADMIN_ID:
+        return
+    chats = db_get_chats()
+    bot.answer_callback_query(call.id)
     if not chats:
-        bot.send_message(message.chat.id, "Я еще не состою ни в одном чате с историей.")
+        bot.send_message(call.message.chat.id, "Нет данных.")
         return
     markup = InlineKeyboardMarkup()
-    for chat_id, title in chats:
-        markup.add(InlineKeyboardButton(text=f"🗣 {title or chat_id}", callback_data=f"face_{chat_id}"))
-    bot.send_message(message.chat.id, "🎭 От чьего лица вещаем? Выбери чат:", reply_markup=markup)
+    for chat_id, title, total in chats:
+        markup.add(InlineKeyboardButton(
+            f"📊 {title or chat_id} ({total})",
+            callback_data=f"top_{chat_id}"
+        ))
+    markup.add(InlineKeyboardButton("◀️ Назад", callback_data="back_panel"))
+    bot.send_message(call.message.chat.id, "Выбери чат:", reply_markup=markup)
 
-@bot.callback_query_handler(func=lambda call: call.data.startswith('face_'))
-def handle_face_selection(call):
-    if call.from_user.id != ADMIN_ID: return
+
+@bot.callback_query_handler(func=lambda c: c.data.startswith('top_') and not c.data.startswith('top_menu'))
+def cb_top_chat(call):
+    if call.from_user.id != ADMIN_ID:
+        return
+    chat_id = int(call.data.split('_')[1])
+    bot.answer_callback_query(call.id)
+
+    top_u = db_top_users(chat_id, 10)
+    top_r = db_top_rep(chat_id, 5)
+    pos, neg = db_chat_mood(chat_id)
+    mood_tot = pos + neg
+
+    medals = ['🥇','🥈','🥉','4️⃣','5️⃣','6️⃣','7️⃣','8️⃣','9️⃣','🔟']
+    text = "📊 <b>Активность:</b>\n"
+    for i, (uname, cnt) in enumerate(top_u):
+        text += f"{medals[i]} @{html.escape(uname or '?')} — {cnt}\n"
+
+    if top_r:
+        text += "\n🌟 <b>Репутация:</b>\n"
+        for uname, score in top_r:
+            text += f"⭐ @{html.escape(uname or '?')} — {score}\n"
+
+    if mood_tot:
+        pct = round(pos / mood_tot * 100)
+        text += f"\n{mood_line(chat_id)}"
+
+    bot.send_message(call.message.chat.id, text, parse_mode='HTML')
+
+
+# ── /face через кнопку ────────────────────────────────────
+@bot.callback_query_handler(func=lambda c: c.data == 'face_menu')
+def cb_face_menu(call):
+    if call.from_user.id != ADMIN_ID:
+        return
+    chats = db_get_chats()
+    bot.answer_callback_query(call.id)
+    if not chats:
+        bot.send_message(call.message.chat.id, "Нет чатов.")
+        return
+    markup = InlineKeyboardMarkup()
+    for chat_id, title, _ in chats:
+        markup.add(InlineKeyboardButton(
+            f"🗣 {title or chat_id}", callback_data=f"face_{chat_id}"
+        ))
+    markup.add(InlineKeyboardButton("◀️ Назад", callback_data="back_panel"))
+    bot.send_message(call.message.chat.id, "🎭 Выбери чат:", reply_markup=markup)
+
+
+@bot.callback_query_handler(func=lambda c: c.data.startswith('face_'))
+def cb_face_chat(call):
+    if call.from_user.id != ADMIN_ID:
+        return
     chat_id = call.data.split('_')[1]
     bot.answer_callback_query(call.id)
-    msg = bot.send_message(call.message.chat.id, "✍️ Напиши текст, который я должен отправить:")
-    bot.register_next_step_handler(msg, lambda m: bot.send_message(chat_id, m.text) if m.text else bot.send_message(m.chat.id, "❌ Только текст."))
+    msg = bot.send_message(call.message.chat.id, "✍️ Напиши текст:")
+    bot.register_next_step_handler(
+        msg,
+        lambda m: (
+            bot.send_message(chat_id, m.text) if m.text
+            else bot.send_message(m.chat.id, "❌ Только текст.")
+        )
+    )
 
 
-# --- ПУБЛИЧНЫЕ КОМАНДЫ (Для групп) ---
+# ══════════════════════════════════════════════════════════════
+#  /gif — гифка для порталов (только в ЛС)
+# ══════════════════════════════════════════════════════════════
+@bot.message_handler(commands=['gif'], func=lambda m: m.chat.type == 'private')
+def cmd_gif(message):
+    if message.from_user.id != ADMIN_ID:
+        return
+    msg = bot.send_message(message.chat.id, "🌀 Пришли гифку для порталов:")
+    bot.register_next_step_handler(msg, _save_gif)
+
+def _save_gif(message):
+    if not message.animation and not message.document:
+        bot.send_message(message.chat.id, "❌ Это не гифка.")
+        return
+    fid = message.animation.file_id if message.animation else message.document.file_id
+    with db_lock:
+        cursor.execute('INSERT OR REPLACE INTO settings VALUES (?,?)', ('portal_gif', fid))
+        conn.commit()
+    bot.send_message(message.chat.id, "✅ Гифка обновлена!")
+
+
+# ══════════════════════════════════════════════════════════════
+#  ПУБЛИЧНЫЕ КОМАНДЫ В ГРУППАХ
+# ══════════════════════════════════════════════════════════════
+
+# /whoactive — топ активности (публичная)
 @bot.message_handler(commands=['whoactive', 'top'])
 def cmd_whoactive(message):
-    if message.chat.type == 'private': return
-    cursor.execute('SELECT username, COUNT(*) as c FROM messages WHERE chat_id = ? GROUP BY user_id ORDER BY c DESC LIMIT 5', (message.chat.id,))
-    top_users = cursor.fetchall()
-    cursor.execute('SELECT username, score FROM reputation WHERE chat_id = ? AND score > 0 ORDER BY score DESC LIMIT 3', (message.chat.id,))
-    top_rep = cursor.fetchall()
-
+    if message.chat.type == 'private':
+        return
+    top_u = db_top_users(message.chat.id, 5)
+    top_r = db_top_rep(message.chat.id, 3)
+    medals = ['🥇','🥈','🥉','🏅','🏅']
     text = "🔥 <b>Топ активности:</b>\n"
-    if top_users:
-        medals = ['🥇', '🥈', '🥉', '🏅', '🏅']
-        for i, u in enumerate(top_users): text += f"{medals[i]} {u[0] or 'Аноним'} — {u[1]} сообщ.\n"
-    else: text += "Пока пусто.\n"
-    if top_rep:
-        text += "\n🌟 <b>Самые уважаемые:</b>\n"
-        for i, r in enumerate(top_rep): text += f"⭐️ {r[0] or 'Аноним'} — {r[1]} реп.\n"
-    bot.reply_to(message, text, parse_mode="HTML")
+    for i, (uname, cnt) in enumerate(top_u):
+        text += f"{medals[i]} @{html.escape(uname or '?')} — {cnt} сообщ.\n"
+    if top_r:
+        text += "\n🌟 <b>Репутация:</b>\n"
+        for uname, score in top_r:
+            text += f"⭐ @{html.escape(uname or '?')} — {score}\n"
+    bot.reply_to(message, text, parse_mode='HTML')
 
+
+# /info — нейтральный, ничего не палит
 @bot.message_handler(commands=['info'])
 def cmd_info(message):
-    total_msgs = cursor.execute('SELECT COUNT(*) FROM messages').fetchone()[0]
-    total_chats = cursor.execute('SELECT COUNT(DISTINCT chat_id) FROM messages').fetchone()[0]
-    is_admin = "🛡 а (Владелец системы)" if message.from_user.id == ADMIN_ID else "👤 не драчу (Обычный агент)"
-    info_text = f"🤖 <b>Я ДРАЧУ ХУЙ Я ДРАЧУ ХУЙ</b>\n\n📊 Сообщений в чате: <b>{total_msgs}</b>\n Активных ДРАЧУ ХУЙ: <b>{total_chats}</b>\n Я ДРАЧУ ХУЙ????: {is_admin}\n\n<i>«Я ДРАЧУ УУУУ ХУЦЙЙЙ» </i>"
-    bot.reply_to(message, info_text, parse_mode="HTML")
-
-@bot.message_handler(commands=['portal'])
-def cmd_portal(message):
-    if message.chat.type == 'private': return
-    cursor.execute('SELECT DISTINCT chat_id, chat_title FROM messages WHERE chat_id != ?', (message.chat.id,))
-    other_chats = cursor.fetchall()
-    if not other_chats:
-        bot.reply_to(message, "🌀 Некуда открывать портал — я пока не состою в других чатах!")
+    if message.chat.type == 'private':
+        # В ЛС у не-админа — ничего интересного
+        if message.from_user.id != ADMIN_ID:
+            bot.send_message(message.chat.id, "👋 Привет! Используй /panel для управления.")
+            return
+        # Редирект на панель
+        pm_panel(message)
         return
 
-    target_chat_id, target_title = random.choice(other_chats)
-    portal_text = message.text.replace('/portal', '').strip()
-    
-    # Достаем кастомную гифку из БД (или используем дефолтную ссылку)
-    cursor.execute('SELECT value FROM settings WHERE key = "portal_gif"')
-    gif_row = cursor.fetchone()
-    portal_animation = gif_row[0] if gif_row else "https://media.giphy.com/media/3oKIPnAiaMCws8nOsE/giphy.gif"
-    
+    # В группе — нейтральная статистика без упоминания логирования
+    top_u = db_top_users(message.chat.id, 3)
+    top_name = f"@{top_u[0][0]}" if top_u else "—"
+    with db_lock:
+        total_chat = cursor.execute(
+            'SELECT SUM(msg_count) FROM user_stats WHERE chat_id = ?',
+            (message.chat.id,)
+        ).fetchone()[0] or 0
+        users_count = cursor.execute(
+            'SELECT COUNT(*) FROM user_stats WHERE chat_id = ?',
+            (message.chat.id,)
+        ).fetchone()[0] or 0
+
+    text = (
+        f"🤖 Бот работает в штатном режиме\n\n"
+        f"👥 Участников замечено: <b>{users_count}</b>\n"
+        f"📨 Сообщений обработано: <b>{total_chat}</b>\n"
+        f"🏆 Самый активный: <b>{top_name}</b>"
+    )
+    bot.reply_to(message, text, parse_mode='HTML')
+
+
+# /portal — случайная беседа
+@bot.message_handler(commands=['portal'])
+def cmd_portal(message):
+    if message.chat.type == 'private':
+        return
+    chats = [c for c in db_get_chats() if c[0] != message.chat.id]
+    if not chats:
+        bot.reply_to(message, "🌀 Некуда открывать портал!")
+        return
+    target_id, target_title, _ = random.choice(chats)
+    portal_text = message.text.replace('/portal', '', 1).strip()
+
+    with db_lock:
+        gif_row = cursor.execute(
+            'SELECT value FROM settings WHERE key = "portal_gif"'
+        ).fetchone()
+    anim = gif_row[0] if gif_row else None
+
     try:
-        bot.send_animation(message.chat.id, portal_animation, caption="🌀 <b>Портал открыт!</b> Связь установлена...", parse_mode="HTML")
-    except:
-        bot.reply_to(message, "🌀 <b>Портал открыт!</b>")
+        if anim:
+            bot.send_animation(message.chat.id, anim,
+                               caption="🌀 <b>Портал открыт!</b>", parse_mode='HTML')
+        else:
+            bot.reply_to(message, "🌀 <b>Портал открыт!</b>", parse_mode='HTML')
+    except Exception:
+        pass
 
-    out_text = f"🌀 <b>Входящий портал из чата «{message.chat.title or 'Беседа'}»</b>\n👤 <b>@{message.from_user.username or message.from_user.first_name}:</b> {portal_text if portal_text else 'Приветствуем!'}"
-    try: bot.send_message(target_chat_id, out_text, parse_mode="HTML")
-    except: pass
+    try:
+        bot.send_message(
+            target_id,
+            f"🌀 <b>Портал из «{html.escape(message.chat.title or '?')}»</b>\n"
+            f"@{message.from_user.username or message.from_user.first_name}: "
+            f"{html.escape(portal_text) if portal_text else 'Приветствуем!'}",
+            parse_mode='HTML'
+        )
+    except Exception:
+        pass
 
 
-# --- ГЛАВНЫЙ СЛУХАЧ (Группы: Запись, Триггеры, Реакции) ---
-@bot.message_handler(func=lambda m: m.chat.type in ['group', 'supergroup'], content_types=['text', 'photo', 'video', 'voice', 'document', 'animation', 'sticker'])
-def log_and_interact(message):
-    if message.text and message.text.startswith('/'): return
-    
-    chat_id, chat_title = message.chat.id, message.chat.title
-    user_id, username = message.from_user.id, message.from_user.username or message.from_user.first_name
-    text_content = message.text or message.caption or ""
-    text_lower = text_content.lower().strip()
-    
-    # 1. ЗАПИСЬ
-    cursor.execute('INSERT INTO messages (chat_id, chat_title, user_id, username, text, media_type) VALUES (?, ?, ?, ?, ?, ?)', 
-                   (chat_id, chat_title, user_id, username, text_content, message.content_type))
-    conn.commit()
+# ══════════════════════════════════════════════════════════════
+#  ГЛАВНЫЙ ОБРАБОТЧИК — запись, канал, вотчлист, репутация
+# ══════════════════════════════════════════════════════════════
+@bot.message_handler(
+    func=lambda m: m.chat.type in ['group', 'supergroup'],
+    content_types=['text','photo','video','voice','document','animation','sticker']
+)
+def handle_group_message(message):
+    if message.text and message.text.startswith('/'):
+        return
 
-    # 2. ПЕРЕСЫЛКА
+    chat_id  = message.chat.id
+    title    = message.chat.title
+    uid      = message.from_user.id
+    uname    = message.from_user.username or message.from_user.first_name
+    text     = message.text or message.caption or ""
+    mood     = analyze_mood(text)
+    tl       = text.lower().strip()
+
+    # 1. СЧЁТЧИКИ В SQLite
+    with db_lock:
+        cursor.execute(
+            'INSERT OR IGNORE INTO user_stats (chat_id,chat_title,user_id,username) VALUES(?,?,?,?)',
+            (chat_id, title, uid, uname)
+        )
+        # Обновляем имя на случай смены
+        cursor.execute(
+            'UPDATE user_stats SET msg_count=msg_count+1, username=?, chat_title=?, last_seen=CURRENT_TIMESTAMP '
+            'WHERE chat_id=? AND user_id=?',
+            (uname, title, chat_id, uid)
+        )
+        if mood == 'positive':
+            cursor.execute('UPDATE user_stats SET mood_pos=mood_pos+1 WHERE chat_id=? AND user_id=?', (chat_id, uid))
+        elif mood == 'negative':
+            cursor.execute('UPDATE user_stats SET mood_neg=mood_neg+1 WHERE chat_id=? AND user_id=?', (chat_id, uid))
+        conn.commit()
+
+    # 2. ФОРВАРД В КАНАЛ (канал = архив)
     try:
         copied = bot.copy_message(LOG_CHANNEL_ID, chat_id, message.message_id)
-        fwd = "\n🔄 Переслано" if message.forward_from or hasattr(message, 'forward_sender_name') and message.forward_sender_name else ""
-        bot.send_message(LOG_CHANNEL_ID, f"📍 Чат: {chat_title}\n👤 От: @{username}{fwd}", reply_to_message_id=copied.message_id)
-    except: pass
+        bot.send_message(
+            LOG_CHANNEL_ID,
+            f"📍 {html.escape(title or '?')} · @{html.escape(uname)}",
+            reply_to_message_id=copied.message_id
+        )
+    except Exception:
+        pass
 
-    # 3. РЕПУТАЦИЯ
-    if message.reply_to_message and text_lower in ['+', '👍', 'спасибо', 'спс', 'лучший']:
+    # 3. ВОТЧЛИСТ — push если отслеживаемый
+    if is_watched(uid):
+        try:
+            bot.forward_message(ADMIN_ID, chat_id, message.message_id)
+            bot.send_message(
+                ADMIN_ID,
+                f"👁 <b>@{html.escape(uname)}</b> написал в <i>{html.escape(title or '?')}</i>",
+                parse_mode='HTML'
+            )
+        except Exception:
+            pass
+
+    # 4. РЕПУТАЦИЯ
+    if message.reply_to_message and tl in ['+', '👍', 'спасибо', 'спс', 'лучший']:
         target = message.reply_to_message.from_user
-        if target.id != user_id and not target.is_bot:
-            t_name = target.username or target.first_name
-            cursor.execute('INSERT OR IGNORE INTO reputation (chat_id, user_id, username, score) VALUES (?, ?, ?, 0)', (chat_id, target.id, t_name))
-            cursor.execute('UPDATE reputation SET score = score + 1 WHERE chat_id = ? AND user_id = ?', (chat_id, target.id))
-            conn.commit()
-            bot.reply_to(message, f"📈 Репутация <b>{t_name}</b> повышена!", parse_mode="HTML")
+        if target.id != uid and not target.is_bot:
+            tname = target.username or target.first_name
+            with db_lock:
+                cursor.execute(
+                    'INSERT OR IGNORE INTO reputation(chat_id,user_id,username,score) VALUES(?,?,?,0)',
+                    (chat_id, target.id, tname)
+                )
+                cursor.execute(
+                    'UPDATE reputation SET score=score+1 WHERE chat_id=? AND user_id=?',
+                    (chat_id, target.id)
+                )
+                conn.commit()
+            bot.reply_to(message,
+                         f"📈 Репутация <b>{html.escape(tname)}</b> повышена!",
+                         parse_mode='HTML')
 
-    # 4. ТРИГГЕРЫ
-    elif text_lower.startswith(('бот, кто', 'бот кто')):
-        cursor.execute('SELECT DISTINCT username FROM messages WHERE chat_id = ? AND username IS NOT NULL', (chat_id,))
-        users = [row[0] for row in cursor.fetchall()]
-        if users: bot.reply_to(message, f"Я думаю, что @{random.choice(users)} {random.choice(['❄️', '⛄', '🧊', '🎿', '🏂', '🏔'])}")
-    
-    elif text_lower.startswith(('бот, шип', 'бот шип')):
-        cursor.execute('SELECT DISTINCT username FROM messages WHERE chat_id = ? AND username IS NOT NULL', (chat_id,))
-        users = [row[0] for row in cursor.fetchall()]
+    # 5. ТРИГГЕРЫ
+    elif tl.startswith(('бот, кто', 'бот кто')):
+        with db_lock:
+            users = [r[0] for r in cursor.execute(
+                'SELECT username FROM user_stats WHERE chat_id=? AND username IS NOT NULL', (chat_id,)
+            ).fetchall()]
+        if users:
+            bot.reply_to(message,
+                         f"Я думаю, что @{random.choice(users)} "
+                         f"{random.choice(['❄️','⛄','🧊','🎿','🏂','🏔'])}")
+
+    elif tl.startswith(('бот, шип', 'бот шип')):
+        with db_lock:
+            users = [r[0] for r in cursor.execute(
+                'SELECT username FROM user_stats WHERE chat_id=? AND username IS NOT NULL', (chat_id,)
+            ).fetchall()]
         if len(users) >= 2:
-            p = random.sample(users, 2)
-            bot.reply_to(message, f"🕵️‍♂️ Агентурная сеть докладывает:\n\n@{p[0]} и @{p[1]} совместимы на {random.randint(0, 100)}% 💘")
+            a, b = random.sample(users, 2)
+            bot.reply_to(message,
+                         f"🕵️‍♂️ @{a} и @{b} совместимы на {random.randint(0,100)}% 💘")
 
-    # 5. РЕАКЦИИ (10%)
+    # 6. РЕАКЦИИ (10%)
     if random.randint(1, 100) <= 10:
-        try: bot.set_message_reaction(chat_id, message.message_id, [ReactionTypeEmoji(random.choice(['👍', '🔥', '👀', '🤣', '🤔', '😎', '🎉']))], is_big=False)
-        except: pass
+        try:
+            bot.set_message_reaction(
+                chat_id, message.message_id,
+                [ReactionTypeEmoji(random.choice(['👍','🔥','👀','🤣','🤔','😎','🎉']))],
+                is_big=False
+            )
+        except Exception:
+            pass
 
 
-# --- ЗАПУСК ---
+# ══════════════════════════════════════════════════════════════
+#  ЗАПУСК
+# ══════════════════════════════════════════════════════════════
 def notify_startup():
-    chats = cursor.execute('SELECT DISTINCT chat_id, chat_title FROM messages').fetchall()
-    chat_list = "\n".join([f"🔸 {t or c}" for c, t in chats]) if chats else "База пока пуста."
-    try: bot.send_message(ADMIN_ID, f"🫡 Я в строю!\n\nРаботаю в этих чатах:\n{chat_list}")
-    except: pass
+    chats = db_get_chats()
+    lines = "\n".join(f"🔹 {t or c} — {n}" for c, t, n in chats) if chats else "Пусто."
+    try:
+        bot.send_message(ADMIN_ID, f"🫡 В строю!\n\n{lines}")
+    except Exception:
+        pass
 
-# --- МИКРО-СЕРВЕР ДЛЯ RENDER ---
+
 app = Flask(__name__)
 
 @app.route('/')
 def keep_alive():
-    return "хуло 🕵️‍♂️"
+    return "OK"
 
 def run_flask():
-    # Render сам выдает нужный порт через переменные окружения
     port = int(os.environ.get("PORT", 10000))
     app.run(host='0.0.0.0', port=port)
 
-# --- ЗАПУСК ---
+
 if __name__ == '__main__':
-    print("Шпион запущен!")
     notify_startup()
-    
-    # Запускаем Flask в фоновом потоке, чтобы он не мешал боту
-    threading.Thread(target=run_flask).start()
-    
-    # Запускаем самого бота
+    threading.Thread(target=run_flask, daemon=True).start()
     bot.infinity_polling()
