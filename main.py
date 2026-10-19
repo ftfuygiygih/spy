@@ -175,8 +175,61 @@ def remove_from_watch(user_id: int):
 
 
 # ══════════════════════════════════════════════════════════════
-#  /watch — в группе: ответь на сообщение + /watch
+#  /watch — в группе реплаем ИЛИ в ЛС по @username / user_id
 # ══════════════════════════════════════════════════════════════
+
+@bot.message_handler(commands=['watch'], func=lambda m: m.chat.type == 'private')
+def cmd_watch_pm(message):
+    """В ЛС: /watch @username  или  /watch 123456789"""
+    if message.from_user.id != ADMIN_ID:
+        return
+
+    arg = message.text.replace('/watch', '', 1).strip()
+
+    if not arg:
+        bot.send_message(
+            message.chat.id,
+            "👁 Использование:\n"
+            "<code>/watch @username</code>\n"
+            "<code>/watch 123456789</code>  (user_id)\n\n"
+            "Ищу по тем, кто уже писал в отслеживаемых чатах.",
+            parse_mode='HTML'
+        )
+        return
+
+    # Ищем по user_id или username в user_stats
+    if arg.lstrip('@').isdigit():
+        uid = int(arg.lstrip('@'))
+        with db_lock:
+            row = cursor.execute(
+                'SELECT user_id, username FROM user_stats WHERE user_id = ? LIMIT 1', (uid,)
+            ).fetchone()
+    else:
+        uname_q = arg.lstrip('@')
+        with db_lock:
+            row = cursor.execute(
+                'SELECT user_id, username FROM user_stats WHERE username LIKE ? LIMIT 1',
+                (f'%{uname_q}%',)
+            ).fetchone()
+
+    if not row:
+        bot.send_message(
+            message.chat.id,
+            f"❌ Не нашёл <code>{html.escape(arg)}</code> в базе.\n"
+            f"Этот человек ещё не писал ни в одном из чатов.",
+            parse_mode='HTML'
+        )
+        return
+
+    uid, uname = row
+    add_to_watch(uid, uname or arg)
+    bot.send_message(
+        message.chat.id,
+        f"👁 <b>@{html.escape(uname or arg)}</b> (<code>{uid}</code>) добавлен в вотчлист.",
+        parse_mode='HTML'
+    )
+
+
 @bot.message_handler(
     commands=['watch'],
     func=lambda m: m.chat.type in ['group', 'supergroup']
