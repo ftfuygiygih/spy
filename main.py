@@ -2,6 +2,7 @@ import os
 import threading
 import html
 import random
+import json
 
 from flask import Flask
 import telebot
@@ -11,8 +12,8 @@ import sqlite3
 # ══════════════════════════════════════════════════════════════
 #  НАСТРОЙКИ — переменные окружения (Render: Settings → Env Vars)
 # ══════════════════════════════════════════════════════════════
-BOT_TOKEN      = os.getenv("BOT_TOKEN")
-ADMIN_ID       = int(os.getenv("ADMIN_ID", "0"))
+BOT_TOKEN      = os.getenv("BOT_TOKEN",      "REPLACE_ME")
+ADMIN_ID       = int(os.getenv("ADMIN_ID",   "0"))
 LOG_CHANNEL_ID = int(os.getenv("LOG_CHANNEL_ID", "0"))
 
 bot     = telebot.TeleBot(BOT_TOKEN)
@@ -527,6 +528,14 @@ def handle_group_message(message):
     mood     = analyze_mood(text)
     tl       = text.lower().strip()
 
+    # 0. СЧЁТЧИК ДЛЯ СНАПШОТА
+    global _msg_counter
+    with _msg_counter_lock:
+        _msg_counter += 1
+        do_snapshot = (_msg_counter % SNAPSHOT_EVERY == 0)
+    if do_snapshot:
+        threading.Thread(target=save_snapshot, daemon=True).start()
+
     # 1. СЧЁТЧИКИ В SQLite
     with db_lock:
         cursor.execute(
@@ -621,17 +630,127 @@ def handle_group_message(message):
 
 
 # ══════════════════════════════════════════════════════════════
-#  ЗАПУСК
+#  СНАПШОТ — сохраняем статистику в канал, восстанавливаем при старте
+#
+#  Зачем: Render сбрасывает файловую систему при каждом перезапуске.
+#  Решение: каждые SNAPSHOT_EVERY сообщений бот сохраняет
+#  статистику JSON-сообщением в лог-канал и закрепляет его.
+#  При старте — читает закреп и восстанавливает счётчики.
 # ══════════════════════════════════════════════════════════════
-def notify_startup():
-    chats = db_get_chats()
-    lines = "\n".join(f"🔹 {t or c} — {n}" for c, t, n in chats) if chats else "Пусто."
+SNAPSHOT_TAG  = "⚙️#STATS"   # тег по которому находим снапшот
+SNAPSHOT_EVERY = 50           # сохранять каждые N сообщений
+
+# Глобальный счётчик сообщений с момента старта
+_msg_counter = 0
+_msg_counter_lock = threading.Lock()
+
+
+def save_snapshot():
+    """Сериализует user_stats + reputation в JSON, постит в канал и закрепляет."""
     try:
-        bot.send_message(ADMIN_ID, f"🫡 В строю!\n\n{lines}")
+        with db_lock:
+            users = cursor.execute('SELECT * FROM user_stats').fetchall()
+            reps  = cursor.execute('SELECT * FROM reputation').fetchall()
+
+        data = {
+            "u": [[r[0], r[1], r[2], r[3], r[4], r[5], r[6]] for r in users],
+            "r": [[r[0], r[1], r[2], r[3]] for r in reps],
+        }
+        payload = json.dumps(data, ensure_ascii=False, separators=(',', ':'))
+
+        # Telegram ограничение — 4096 символов. Если больше, берём топ-100 по count
+        if len(payload) + len(SNAPSHOT_TAG) + 2 > 4096:
+            top = sorted(data["u"], key=lambda x: x[4], reverse=True)[:100]
+            data["u"] = top
+            payload = json.dumps(data, ensure_ascii=False, separators=(',', ':'))
+
+        text = f"{SNAPSHOT_TAG}\n{payload}"
+
+        # Получаем ID старого закрепа чтобы потом открепить
+        old_pin_id = None
+        try:
+            ch = bot.get_chat(LOG_CHANNEL_ID)
+            if ch.pinned_message and ch.pinned_message.text and SNAPSHOT_TAG in ch.pinned_message.text:
+                old_pin_id = ch.pinned_message.message_id
+        except Exception:
+            pass
+
+        # Постим новый снапшот
+        msg = bot.send_message(LOG_CHANNEL_ID, text, disable_notification=True)
+        bot.pin_chat_message(LOG_CHANNEL_ID, msg.message_id, disable_notification=True)
+
+        # Удаляем старый снапшот из канала (чтобы не засорять)
+        if old_pin_id:
+            try:
+                bot.delete_message(LOG_CHANNEL_ID, old_pin_id)
+            except Exception:
+                pass
+
+    except Exception as e:
+        print(f"[snapshot] save failed: {e}")
+
+
+def restore_from_snapshot():
+    """При старте читает закреплённое сообщение канала и восстанавливает счётчики."""
+    try:
+        ch = bot.get_chat(LOG_CHANNEL_ID)
+        if not ch.pinned_message:
+            print("[snapshot] нет закреплённого сообщения, начинаем с нуля")
+            return False
+
+        text = ch.pinned_message.text or ""
+        if SNAPSHOT_TAG not in text:
+            print("[snapshot] закреп не содержит снапшота")
+            return False
+
+        payload = text[text.index('\n') + 1:]
+        data    = json.loads(payload)
+
+        with db_lock:
+            # Восстанавливаем user_stats
+            # u: [chat_id, chat_title, user_id, username, msg_count, mood_pos, mood_neg]
+            for u in data.get("u", []):
+                cursor.execute(
+                    'INSERT OR REPLACE INTO user_stats '
+                    '(chat_id, chat_title, user_id, username, msg_count, mood_pos, mood_neg) '
+                    'VALUES (?,?,?,?,?,?,?)',
+                    (u[0], u[1], u[2], u[3], u[4], u[5], u[6])
+                )
+            # Восстанавливаем reputation
+            # r: [chat_id, user_id, username, score]
+            for r in data.get("r", []):
+                cursor.execute(
+                    'INSERT OR REPLACE INTO reputation (chat_id, user_id, username, score) VALUES (?,?,?,?)',
+                    (r[0], r[1], r[2], r[3])
+                )
+            conn.commit()
+
+        total = sum(u[4] for u in data.get("u", []))
+        print(f"[snapshot] восстановлено: {len(data.get('u', []))} пользователей, {total} сообщений")
+        return True
+
+    except Exception as e:
+        print(f"[snapshot] restore failed: {e}")
+        return False
+
+
+def notify_startup():
+    """Восстанавливаем снапшот → уведомляем админа."""
+    restored = restore_from_snapshot()
+
+    chats = db_get_chats()
+    lines = "\n".join(f"🔹 {t or c} — {n} сообщ." for c, t, n in chats) if chats else "Пусто."
+    status = "♻️ Статистика восстановлена из канала" if restored else "🆕 Начинаю с нуля"
+
+    try:
+        bot.send_message(ADMIN_ID, f"🫡 В строю!\n{status}\n\n{lines}")
     except Exception:
         pass
 
 
+# ══════════════════════════════════════════════════════════════
+#  ЗАПУСК
+# ══════════════════════════════════════════════════════════════
 app = Flask(__name__)
 
 @app.route('/')
